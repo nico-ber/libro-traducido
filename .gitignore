@@ -1,0 +1,26 @@
+# Ignorar entornos virtuales
+env/
+venv/
+ENV/
+.venv/
+.Python
+
+# Archivos de sistema
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de logs
+*.log
+log_*.txt
+
+# Archivos de salida
+/output/
+*.json
+
+# Archivos temporales
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
