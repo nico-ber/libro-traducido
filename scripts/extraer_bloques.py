@@ -1,143 +1,127 @@
-import fitz  # PyMuPDF
-import json
-import numpy as np
-import sys
-import os
+#!/usr/bin/env python
+# extraer_bloques.py — v8.0-b
+# ---------------------------
+# • Márgenes globales por página (percentil 5 y 95).
+# • Alineación interna con tolerancia --tol-px (default 4 px).
+# • --debug-align imprime distancias y texto por línea.
+# -----------------------------------------------------------
 
-def estimar_margen(doc):
-    num_pages = len(doc)
-    paginas_centro = range(num_pages // 2 - 5, num_pages // 2 + 5)
-    bbox_totales = []
+import argparse, json, statistics, time, sys
+from pathlib import Path
+from typing import List, Dict, Set
 
-    for i in paginas_centro:
-        for b in doc[i].get_text("blocks"):
-            if b[4].strip():  # texto no vacío
-                bbox_totales.append(b[:4])
+h = lambda b: b[3] - b[1]
+w = lambda b: b[2] - b[0]
 
-    x0s = [b[0] for b in bbox_totales]
-    y0s = [b[1] for b in bbox_totales]
-    x1s = [b[2] for b in bbox_totales]
-    y1s = [b[3] for b in bbox_totales]
-
-    margen = [
-        round(float(np.percentile(x0s, 5)), 2),
-        round(float(np.percentile(y0s, 5)), 2),
-        round(float(np.percentile(x1s, 95)), 2),
-        round(float(np.percentile(y1s, 95)), 2),
-    ]
-    print(f"🟦 Margen estimado: {margen}")
-    return margen
-
-def agrupar_en_parrafos(bloques_lineas, tolerancia_dinamica):
-    parrafos = []
-    bloque_actual = []
-    y_anterior = None
-    log_lines = []
-
-    for linea in bloques_lineas:
-        y_actual = linea["bbox"][1]
-        texto = linea["texto"]
-        pagina = linea["pagina"]
-
-        log_lines.append(f"[DEBUG] Evaluando línea (página {pagina}): {texto}")
-
-        if y_anterior is not None and abs(y_actual - y_anterior) > tolerancia_dinamica:
-            if bloque_actual:
-                log_lines.append(f"[DEBUG] → Nuevo párrafo con {len(bloque_actual)} líneas")
-                parrafos.append(bloque_actual)
-            bloque_actual = []
-
-        bloque_actual.append(linea)
-        y_anterior = linea["bbox"][3]
-
-    if bloque_actual:
-        log_lines.append(f"[DEBUG] → Último párrafo con {len(bloque_actual)} líneas")
-        parrafos.append(bloque_actual)
-
-    with open("log_parrafos.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(log_lines))
-
-    bloques_parrafo = []
-    for grupo in parrafos:
-        if not grupo:
-            continue
-        x0 = min(l["bbox"][0] for l in grupo)
-        y0 = min(l["bbox"][1] for l in grupo)
-        x1 = max(l["bbox"][2] for l in grupo)
-        y1 = max(l["bbox"][3] for l in grupo)
-        texto = "\n".join(l["texto"] for l in grupo)
-        bloques_parrafo.append({
-            "pagina": grupo[0]["pagina"],
-            "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
-            "texto": texto,
-            "font_size": round(np.mean([l["font_size"] for l in grupo]), 2),
-            "alineacion": grupo[0]["alineacion"],
-            "tipo": "parrafo"
-        })
-    return bloques_parrafo
-
-def detectar_alineacion(x0, x1, page_width, margen_izq, margen_der, tolerancia=20):
-    centro = page_width / 2
-    bloque_centro = abs((x0 + x1) / 2 - centro) < tolerancia
-    if bloque_centro:
-        return "centro"
-    elif abs(x0 - margen_izq) < tolerancia:
-        return "izquierda"
-    elif abs(x1 - margen_der) < tolerancia:
-        return "derecha"
-    else:
-        return "izquierda"
-
-def procesar_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    margen = estimar_margen(doc)
-    bloques = []
-
-    for page_num, page in enumerate(doc, start=1):
-        width = page.rect.width
-        bloques_lineas = []
-
-        lines = page.get_text("dict")["blocks"]
-        alturas = []
-        for b in lines:
-            if "lines" not in b:
-                continue
-            for l in b["lines"]:
-                for s in l["spans"]:
-                    x0, y0, x1, y1 = s["bbox"]
-                    texto = s["text"].strip()
-                    if not texto:
-                        continue
-                    altura = y1 - y0
-                    alturas.append(altura)
-                    bloques_lineas.append({
-                        "pagina": page_num,
-                        "bbox": [x0, y0, x1, y1],
-                        "texto": texto,
-                        "font_size": s["size"],
-                        "alineacion": detectar_alineacion(x0, x1, width, margen[0], margen[2]),
-                        "tipo": "parrafo"
-                    })
-
-        if alturas:
-            tolerancia = round(float(np.percentile(alturas, 80)), 2)
+def parse_page_set(spec: str) -> Set[int]:
+    pages=set()
+    for part in spec.split(","):
+        part=part.strip()
+        if not part: continue
+        if "-" in part:
+            a,b=map(int,part.split("-",1))
+            pages.update(range(a,b+1))
         else:
-            tolerancia = 5.0
-        print(f"🟦 Tolerancia dinámica estimada: {tolerancia}")
-        parrafos = agrupar_en_parrafos(bloques_lineas, tolerancia)
-        bloques.extend(parrafos)
+            pages.add(int(part))
+    return pages
 
-    return bloques
+def internal_align(l, page_left, page_right, tol, debug=False):
+    left_g  = abs(l["bbox"][0]  - page_left)
+    right_g = abs(page_right    - l["bbox"][2])
+    left_ok  = left_g  <= tol
+    right_ok = right_g <= tol
+    if left_ok and right_ok:
+        align="justificado"
+    elif right_ok:
+        align="derecha"
+    elif left_ok:
+        align="izquierda"
+    elif abs(left_g - right_g) <= tol:
+        align="centro"
+    else:
+        align="izquierda"
+    if debug and not l.get("_dbg_done"):
+        snippet=l["texto"].replace("\n"," ")[:60]
+        print(f"[dbg] pág {l['pagina']:>3} y={l['bbox'][1]:>4} "
+              f"L{left_g:>3} R{right_g:>3} tol={tol:>2} → {align} «{snippet}»")
+        l["_dbg_done"] = True
+    return align
 
-if __name__ == "__main__":
-    import argparse
+def group_lines(lines: List[dict], args, page_left, page_right):
+    if not lines: return []
+    med_h=statistics.median(h(l["bbox"]) for l in lines)
+    p=lines[0]
+    cur={"parts":[p["texto"]],"bbox":list(p["bbox"]),"fs":h(p["bbox"]),
+         "indent":p["bbox"][0],
+         "align":internal_align(p,page_left,page_right,args.tol_px,args.debug_align)}
+    blocks=[]
+    for ln in lines[1:]:
+        gap_ok=(ln["bbox"][1]-p["bbox"][3])<=args.max_gap*med_h
+        new_align=internal_align(ln,page_left,page_right,args.tol_px,args.debug_align)
+        indent_ok=abs(ln["bbox"][0]-cur["indent"])<=args.indent_threshold or len(cur["parts"])<2
+        join=gap_ok and indent_ok
+        if join:
+            cur["parts"].append(ln["texto"])
+            x0,y0,x1,y1=cur["bbox"]; lx0,ly0,lx1,ly1=ln["bbox"]
+            cur["bbox"]=[min(x0,lx0),min(y0,ly0),max(x1,lx1),max(y1,ly1)]
+            cur["fs"]=max(cur["fs"],h(ln["bbox"]))
+            cur["indent"]=min(cur["indent"],ln["bbox"][0])
+            cur["align"]="justificado" if cur["align"]=="justificado" or new_align=="justificado" else cur["align"]
+        else:
+            blocks.append(cur)
+            cur={"parts":[ln["texto"]],"bbox":list(ln["bbox"]),
+                 "fs":h(ln["bbox"]),"indent":ln["bbox"][0],
+                 "align":new_align}
+        p=ln
+    blocks.append(cur)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("pdf", help="Ruta al PDF de entrada")
-    parser.add_argument("-o", "--output", default="salida.json", help="Archivo de salida JSON")
-    args = parser.parse_args()
+    res=[]
+    for b in blocks:
+        text=" ".join(b["parts"]).strip()
+        kind="titulo" if b["fs"]>args.title_factor*med_h or text.isupper() else "parrafo"
+        res.append({"texto":text,"bbox":b["bbox"],"font_size":b["fs"],
+                    "tipo":kind,"alineacion":b["align"]})
+    return res
 
-    resultado = procesar_pdf(args.pdf)
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(resultado, f, indent=2, ensure_ascii=False)
-    print(f"✅ JSON generado: {args.output}")
+def build_parser():
+    ap=argparse.ArgumentParser(description="extraer_bloques v8.0-b")
+    ap.add_argument("input"); ap.add_argument("-o","--out",default="bloques.json")
+    ap.add_argument("--pages")
+    ap.add_argument("--max-gap",type=float,default=1.2)
+    ap.add_argument("--indent-threshold",type=int,default=25)
+    ap.add_argument("--title-factor",type=float,default=1.4)
+    ap.add_argument("--tol-px",type=int,default=4,help="Tolerancia en px (default 4)")
+    ap.add_argument("--debug-align",action="store_true")
+    return ap
+
+def main():
+    args=build_parser().parse_args()
+    try:
+        data=json.loads(Path(args.input).read_text("utf-8"))
+    except Exception as e:
+        sys.exit(f"❌ No se pudo leer {args.input}: {e}")
+
+    pages: Dict[int,List[dict]]={}
+    for ln in data:
+        pages.setdefault(ln["pagina"],[]).append(ln)
+
+    sel=parse_page_set(args.pages) if args.pages else None
+    todo=[p for p in sorted(pages) if sel is None or p in sel]
+    if not todo:
+        sys.exit("⚠️  Sin páginas seleccionadas o presentes en el archivo.")
+
+    out=[]
+    for pg in todo:
+        lines=pages[pg]
+        xs=[l["bbox"][0] for l in lines]+[l["bbox"][2] for l in lines]
+        xs_sorted=sorted(xs)
+        page_left = xs_sorted[int(0.05 * len(xs_sorted))]
+        page_right= xs_sorted[int(0.95 * len(xs_sorted))]
+        lines_sorted=sorted(lines,key=lambda l:(l["bbox"][1],l["bbox"][0]))
+        out.extend(group_lines(lines_sorted,args,page_left,page_right))
+
+    Path(args.out).write_text(json.dumps(out,ensure_ascii=False,indent=2),"utf-8")
+    print(f"🌟 Guardado {len(out)} bloques en {args.out}")
+
+if __name__=="__main__":
+    main()

@@ -16,15 +16,41 @@ Proyecto para automatizar el proceso de extracción, traducción y maquetado de 
 
 ```bash
 python -m venv venv
-venv\Scripts\activate        # En Windows
-source venv/bin/activate    # En Linux/macOS
+venv\Scripts\activate
 
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 
-🧠 Uso
-Rehacer OCR (Genera un archivo salida_ocr.json en la raíz del proyecto.)
-python scripts/extraer_ocr.py datos/original.pdf
+## 🧠 Uso
 
-Extraer bloques visuales (texto, imágenes)
-python scripts/extraer_bloques.py datos/original.pdf -o datos/salida.json
+### Rehacer OCR
+
+Genera un archivo `ocr_lineas.json` con el texto línea por línea.
+
+```powershell
+python scripts/extraer_ocr.py datos/original.pdf `
+  --out datos/ocr_lineas.json `
+  --dpi 350 `
+  --lang deu-frak+deu `
+  --psm 4 `
+  --debug
+
+
+
+### Extraer bloques visuales (texto, imágenes)
+
+Genera salida.json con la información estructurada de los bloques detectados (párrafos, notas, imágenes, etc.).
+
+python scripts/extraer_bloques.py `
+      datos/ocr_lineas.json `
+      -o datos/bloques.json `
+      --max-gap 1.3 `
+      --indent-threshold 25 `
+      --justify-threshold 0.18 `
+      --merge-cross-page
+
+
+### Para extraer ciertas páginas de un PDF
+
+python extract_pages.py original.pdf salida.pdf 4-11
