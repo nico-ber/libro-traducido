@@ -1,127 +1,181 @@
-#!/usr/bin/env python
-# extraer_bloques.py — v8.0-b
-# ---------------------------
-# • Márgenes globales por página (percentil 5 y 95).
-# • Alineación interna con tolerancia --tol-px (default 4 px).
-# • --debug-align imprime distancias y texto por línea.
-# -----------------------------------------------------------
 
-import argparse, json, statistics, time, sys
+#!/usr/bin/env python3
+"""extraer_bloques.py — Agrupa líneas OCR en bloques/párrafos.
+
+Cambios clave:
+  • --merge-cross-page: fusiona bloques contiguos entre páginas.
+  • --right-tol (por defecto 50 px): tolerancia para considerar que
+    la línea llega al margen derecho aun si el OCR recorta unos
+    píxeles.
+  • Soporta JSON con clave `bbox` ([x1, y1, x2, y2]) —ya no exige
+    campos 'x', 'y', 'w', 'h'.
+"""
+
+import argparse
+import json
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import Dict, List, Any, Optional
 
-h = lambda b: b[3] - b[1]
-w = lambda b: b[2] - b[0]
+def cargar_lineas(path: Path) -> List[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
 
-def parse_page_set(spec: str) -> Set[int]:
-    pages=set()
-    for part in spec.split(","):
-        part=part.strip()
-        if not part: continue
-        if "-" in part:
-            a,b=map(int,part.split("-",1))
-            pages.update(range(a,b+1))
-        else:
-            pages.add(int(part))
-    return pages
+def guardar(bloques: List[Dict[str, Any]], destino: Optional[Path], input_path: Path) -> None:
+    if destino is None:
+        destino = input_path.with_suffix('').with_name(input_path.stem + '_bloques.json')
+    destino.write_text(json.dumps(bloques, ensure_ascii=False, indent=2), encoding='utf-8')
 
-def internal_align(l, page_left, page_right, tol, debug=False):
-    left_g  = abs(l["bbox"][0]  - page_left)
-    right_g = abs(page_right    - l["bbox"][2])
-    left_ok  = left_g  <= tol
-    right_ok = right_g <= tol
-    if left_ok and right_ok:
-        align="justificado"
-    elif right_ok:
-        align="derecha"
-    elif left_ok:
-        align="izquierda"
-    elif abs(left_g - right_g) <= tol:
-        align="centro"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def coords(ln: Dict[str, Any]):
+    """Devuelve x1, y1, x2, y2, ancho, alto (acepta bbox o x/y/w/h)."""
+    if "bbox" in ln:
+        x1, y1, x2, y2 = ln["bbox"]
+        w = x2 - x1
+        h = y2 - y1
     else:
-        align="izquierda"
-    if debug and not l.get("_dbg_done"):
-        snippet=l["texto"].replace("\n"," ")[:60]
-        print(f"[dbg] pág {l['pagina']:>3} y={l['bbox'][1]:>4} "
-              f"L{left_g:>3} R{right_g:>3} tol={tol:>2} → {align} «{snippet}»")
-        l["_dbg_done"] = True
-    return align
+        x1 = ln["x"]; y1 = ln["y"]; w = ln["w"]; h = ln["h"]
+        x2, y2 = x1 + w, y1 + h
+    return x1, y1, x2, y2, w, h
 
-def group_lines(lines: List[dict], args, page_left, page_right):
-    if not lines: return []
-    med_h=statistics.median(h(l["bbox"]) for l in lines)
-    p=lines[0]
-    cur={"parts":[p["texto"]],"bbox":list(p["bbox"]),"fs":h(p["bbox"]),
-         "indent":p["bbox"][0],
-         "align":internal_align(p,page_left,page_right,args.tol_px,args.debug_align)}
-    blocks=[]
-    for ln in lines[1:]:
-        gap_ok=(ln["bbox"][1]-p["bbox"][3])<=args.max_gap*med_h
-        new_align=internal_align(ln,page_left,page_right,args.tol_px,args.debug_align)
-        indent_ok=abs(ln["bbox"][0]-cur["indent"])<=args.indent_threshold or len(cur["parts"])<2
-        join=gap_ok and indent_ok
-        if join:
-            cur["parts"].append(ln["texto"])
-            x0,y0,x1,y1=cur["bbox"]; lx0,ly0,lx1,ly1=ln["bbox"]
-            cur["bbox"]=[min(x0,lx0),min(y0,ly0),max(x1,lx1),max(y1,ly1)]
-            cur["fs"]=max(cur["fs"],h(ln["bbox"]))
-            cur["indent"]=min(cur["indent"],ln["bbox"][0])
-            cur["align"]="justificado" if cur["align"]=="justificado" or new_align=="justificado" else cur["align"]
-        else:
-            blocks.append(cur)
-            cur={"parts":[ln["texto"]],"bbox":list(ln["bbox"]),
-                 "fs":h(ln["bbox"]),"indent":ln["bbox"][0],
-                 "align":new_align}
-        p=ln
-    blocks.append(cur)
+def detect_align(ln, min_x1, max_x2, indent_threshold, right_tol):
+    x1, _, x2, _, _, _ = coords(ln)
+    li = x1 - min_x1
+    ri = max_x2 - x2
+    if ri <= right_tol and li > indent_threshold:
+        return "derecha"
+    if li <= indent_threshold and ri <= right_tol:
+        return "justificado"
+    if li <= indent_threshold:
+        return "izquierda"
+    return "centrado"
 
-    res=[]
-    for b in blocks:
-        text=" ".join(b["parts"]).strip()
-        kind="titulo" if b["fs"]>args.title_factor*med_h or text.isupper() else "parrafo"
-        res.append({"texto":text,"bbox":b["bbox"],"font_size":b["fs"],
-                    "tipo":kind,"alineacion":b["align"]})
-    return res
+# ---------------------------------------------------------------------------
+# Agrupación
+# ---------------------------------------------------------------------------
 
-def build_parser():
-    ap=argparse.ArgumentParser(description="extraer_bloques v8.0-b")
-    ap.add_argument("input"); ap.add_argument("-o","--out",default="bloques.json")
-    ap.add_argument("--pages")
-    ap.add_argument("--max-gap",type=float,default=1.2)
-    ap.add_argument("--indent-threshold",type=int,default=25)
-    ap.add_argument("--title-factor",type=float,default=1.4)
-    ap.add_argument("--tol-px",type=int,default=4,help="Tolerancia en px (default 4)")
-    ap.add_argument("--debug-align",action="store_true")
-    return ap
+def nuevo_bloque(ln):
+    x1, y1, x2, y2, _, _ = coords(ln)
+    return {
+        "align": ln["align"],
+        "text": ln["texto"],
+        "y_top": y1,
+        "y_bottom": y2,
+        "lines": [ln],
+    }
+
+
+def agrupar_lineas(lineas, tol_px, max_gap):
+    """Agrupa líneas en párrafos con regla de primera línea indentada a la derecha.
+
+    Si el primer renglón de un bloque está alineado a la derecha pero la(s)
+    siguiente(s) línea(s) están alineadas a la izquierda o justificado y
+    cumplen el criterio de gap, lo consideramos un único párrafo. El bloque
+    final toma la justificación predominante (la de la segunda línea).
+    """
+    bloques = []
+    for ln in lineas:
+        if not bloques:
+            bloques.append(nuevo_bloque(ln))
+            continue
+
+        ultimo = bloques[-1]
+        _, y1, _, y2, _, _ = coords(ln)
+        gap = y1 - ultimo["y_bottom"]
+        altura = ultimo["y_bottom"] - ultimo["y_top"] or 1
+        mismo_align = ln["align"] == ultimo["align"]
+
+        union_mismo_parrafo = (abs(gap) <= tol_px or gap / altura <= max_gap)
+
+        if union_mismo_parrafo:
+            # Caso especial: la primera línea (derecha) y la segunda (izq/just)
+            if not mismo_align and ultimo["align"] == "derecha" and len(ultimo["lines"]) == 1 and ln["align"] in {"izquierda", "justificado"}:
+                # Reetiquetar el bloque completo al alineado del segundo renglón
+                ultimo["align"] = ln["align"]
+                mismo_align = True  # ahora son compatibles
+
+            if mismo_align:
+                ultimo["text"] += " " + ln["texto"]
+                ultimo["y_bottom"] = y2
+                ultimo["lines"].append(ln)
+                continue
+
+        # Si no pudo unirse, crear nuevo bloque
+        bloques.append(nuevo_bloque(ln))
+    return bloques
+
+def agrupar_en_bloques(lineas, *, tol_px, max_gap, indent_threshold, right_tol, merge_cross_page, debug_align=False):
+    por_pag = {}
+    for ln in lineas:
+        por_pag.setdefault(ln["pagina"], []).append(ln)
+
+    final = []
+    pags = sorted(por_pag.keys())
+    for i, pag in enumerate(pags):
+        lp = por_pag[pag]
+        min_x1 = min(coords(l)[0] for l in lp)
+        max_x2 = max(coords(l)[2] for l in lp)
+
+        for ln in lp:
+            ln["align"] = detect_align(ln, min_x1, max_x2, indent_threshold, right_tol)
+            if debug_align:
+                li = coords(ln)[0] - min_x1
+                ri = max_x2 - coords(ln)[2]
+                print(f"[dbg] pág {pag:>2} y={coords(ln)[1]:>4} LI={li:<4} RI={ri:<4} → {ln['align']}  {ln['texto'][:60]}")
+        lp.sort(key=lambda l: coords(l)[1])
+
+        bloques = agrupar_lineas(lp, tol_px, max_gap)
+
+        if merge_cross_page and final and bloques and final[-1]["align"] == bloques[0]["align"]:
+            gap = bloques[0]["y_top"] - final[-1]["y_bottom"]
+            altura = final[-1]["y_bottom"] - final[-1]["y_top"] or 1
+            if gap/altura <= max_gap:
+                if debug_align:
+                    print(f"[dbg] Fusionando pág {pags[i-1]}→{pag} gap={gap}")
+                final[-1]["text"] += " " + bloques[0]["text"]
+                final[-1]["y_bottom"] = bloques[0]["y_bottom"]
+                final[-1]["lines"].extend(bloques[0]["lines"])
+                bloques.pop(0)
+
+        final.extend(bloques)
+    return final
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def cli():
+    ap = argparse.ArgumentParser(description="Agrupa líneas OCR en bloques.")
+    ap.add_argument("json_ocr", type=Path)
+    ap.add_argument("--output", "-o", type=Path)
+    ap.add_argument("--pages", nargs="*", type=int)
+    ap.add_argument("--tol-px", type=int, default=4)
+    ap.add_argument("--max-gap", type=float, default=1.3)
+    ap.add_argument("--indent-threshold", type=int, default=25)
+    ap.add_argument("--right-tol", type=int, default=50)
+    ap.add_argument("--merge-cross-page", action="store_true")
+    ap.add_argument("--debug-align", action="store_true")
+    return ap.parse_args()
 
 def main():
-    args=build_parser().parse_args()
-    try:
-        data=json.loads(Path(args.input).read_text("utf-8"))
-    except Exception as e:
-        sys.exit(f"❌ No se pudo leer {args.input}: {e}")
+    args = cli()
+    lineas = cargar_lineas(args.json_ocr)
+    if args.pages:
+        lineas = [l for l in lineas if l["pagina"] in args.pages]
 
-    pages: Dict[int,List[dict]]={}
-    for ln in data:
-        pages.setdefault(ln["pagina"],[]).append(ln)
+    bloques = agrupar_en_bloques(
+        lineas,
+        tol_px=args.tol_px,
+        max_gap=args.max_gap,
+        indent_threshold=args.indent_threshold,
+        right_tol=args.right_tol,
+        merge_cross_page=args.merge_cross_page,
+        debug_align=args.debug_align,
+    )
+    guardar(bloques, args.output, args.json_ocr)
 
-    sel=parse_page_set(args.pages) if args.pages else None
-    todo=[p for p in sorted(pages) if sel is None or p in sel]
-    if not todo:
-        sys.exit("⚠️  Sin páginas seleccionadas o presentes en el archivo.")
-
-    out=[]
-    for pg in todo:
-        lines=pages[pg]
-        xs=[l["bbox"][0] for l in lines]+[l["bbox"][2] for l in lines]
-        xs_sorted=sorted(xs)
-        page_left = xs_sorted[int(0.05 * len(xs_sorted))]
-        page_right= xs_sorted[int(0.95 * len(xs_sorted))]
-        lines_sorted=sorted(lines,key=lambda l:(l["bbox"][1],l["bbox"][0]))
-        out.extend(group_lines(lines_sorted,args,page_left,page_right))
-
-    Path(args.out).write_text(json.dumps(out,ensure_ascii=False,indent=2),"utf-8")
-    print(f"🌟 Guardado {len(out)} bloques en {args.out}")
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
