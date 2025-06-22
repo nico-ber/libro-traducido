@@ -1,109 +1,143 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-extraer_bloques.py — Agrupa líneas OCR y produce bloques.
+extraer_bloques.py — Agrupa líneas OCR en bloques visuales.
 
-Restaurados parámetros eliminados inadvertidamente:
-  • --pages N [N ...]      Filtra páginas (1‑based)
-  • --debug                Traza alineación y fusiones
+• Orden de campos: pagina, text, alineacion, …
+• Bloques unilínea: se marcan con "unilinea": true y omiten "lines".
+• Conserva pagina, bbox, font_size para trazabilidad.
+• Detección básica de referencias a notas al pie (refs_pie).
+• Si no usas -o, crea <nombre>_bloques.json automáticamente.
 
-Adicional:
-  • Bloques de una línea: elimina "lines" y añade "unilinea": true
+Uso:
+  python extraer_bloques.py datos/ocr_lineas.json --pages 9 10 11 12 --debug
 """
 
 import argparse, json, re
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from collections import OrderedDict
+from typing import List, Dict, Any
 
+# ── patrones ────────────────────────────────────────────────────────────────
 DOT_RE = re.compile(r'[.·]{3,}')
 END_NUM_RE = re.compile(r'\d{1,3}\s*$')
+FOOTNOTE_RE = re.compile(r'(?:\[(\d{1,3})\]|(\d{1,3})\)|([⁰¹²³⁴⁵⁶⁷⁸⁹]+))')
 
-def cargar_lineas(path: Path) -> List[Dict[str, Any]]:
-    data = json.loads(path.read_text(encoding='utf-8'))
-    for ln in data:
-        if 'alineacion' not in ln and 'align' in ln:
-            ln['alineacion'] = ln.pop('align')
-        ln.pop('align', None)
-    return data
+# ── util geométrico ─────────────────────────────────────────────────────────
+def bbox(line: Dict[str, Any]) -> List[int]:
+    """Devuelve [x1,y1,x2,y2] aunque falten claves."""
+    if 'bbox' in line and isinstance(line['bbox'], (list, tuple)) and len(line['bbox']) == 4:
+        return line['bbox']
 
-def guardar(bloques: List[Dict[str, Any]], dst: Optional[Path], src: Path):
-    # Simplificar unilíneas
-    for b in bloques:
-        if len(b.get('lines', [])) == 1:
-            b['unilinea'] = True
-            b.pop('lines', None)
-    if dst is None:
-        dst = src.with_name(src.stem + '_bloques.json')
-    dst.write_text(json.dumps(bloques, ensure_ascii=False, indent=2), encoding='utf-8')
+    # Claves sueltas
+    if {'x', 'y', 'w', 'h'} <= line.keys():
+        return [line['x'], line['y'], line['x'] + line['w'], line['y'] + line['h']]
 
-def bbox(ln):
-    if 'bbox' in ln:
-        return ln['bbox']
-    x, y, w, h = ln['x'], ln['y'], ln['w'], ln['h']
-    return [x, y, x + w, y + h]
+    # Si sólo vienen x1,y1,x2,y2…
+    if {'x1', 'y1', 'x2', 'y2'} <= line.keys():
+        return [line['x1'], line['y1'], line['x2'], line['y2']]
 
-def font_size(ln): return bbox(ln)[3] - bbox(ln)[1]
+    # Fallback: todo a 0 para no romper el flujo
+    return [0, 0, 0, 0]
 
-def detect_alineacion(ln, min_x1, max_x2, indent, right_tol):
-    txt = ln['texto']; right = max_x2 - bbox(ln)[2]
-    if right <= right_tol and (DOT_RE.search(txt) or END_NUM_RE.search(txt)):
+def _x(line): return line.get('x', line['bbox'][0])
+def _y(line): return line.get('y', line['bbox'][1])
+def font_size(line): return bbox(line)[3] - bbox(line)[1]
+
+# ── notas al pie ────────────────────────────────────────────────────────────
+def refs_pie(text: str) -> List[str]:
+    return [g for m in FOOTNOTE_RE.finditer(text) for g in m.groups() if g]
+
+# ── alineación ──────────────────────────────────────────────────────────────
+def detect_align(line, min_x1, max_x2, indent, right_tol):
+    ri = max_x2 - bbox(line)[2]
+    txt = line['texto']
+    if ri <= right_tol and (DOT_RE.search(txt) or END_NUM_RE.search(txt)):
         return 'indice'
-    left = bbox(ln)[0] - min_x1
-    if right <= right_tol and left > indent: return 'derecha'
-    if left <= indent and right <= right_tol: return 'justificado'
-    if left <= indent: return 'izquierda'
+    li = _x(line) - min_x1
+    if ri <= right_tol and li > indent: return 'derecha'
+    if li <= indent and ri <= right_tol: return 'justificado'
+    if li <= indent: return 'izquierda'
     return 'centrado'
 
-def nuevo_bloque(ln):
-    b = bbox(ln)
-    return {'alineacion': ln['alineacion'],'text': ln['texto'],
-            'y_top': b[1],'y_bottom': b[3],'font_size': font_size(ln),
-            'lines':[ln]}
+# ── bloque helper ───────────────────────────────────────────────────────────
+def make_block(ls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    first = ls[0]
+    b = OrderedDict()
+    b['pagina'] = first['pagina']
+    b['text'] = " ".join(l['texto'] for l in ls)
+    b['alineacion'] = first['align']
+    if (r := [r for l in ls for r in refs_pie(l['texto'])]): b['refs_pie'] = r
+    b['y_top'] = bbox(first)[1]
+    b['y_bottom'] = bbox(ls[-1])[3]
+    b['font_size'] = sum(font_size(l) for l in ls)/len(ls)
+    b['x_left'] = min(_x(l) for l in ls)
+    b['x_right'] = max(bbox(l)[2] for l in ls)
+    if len(ls) == 1:
+        b['unilinea'] = True
+    else:
+        b['lines'] = ls
+    return b
 
-def agrupar_lineas(lst, tol, gap):
-    blocks=[]
-    for ln in lst:
-        if ln['alineacion'] in {'centrado','indice'} or not blocks or blocks[-1]['alineacion'] in {'centrado','indice'}:
-            blocks.append(nuevo_bloque(ln)); continue
-        last=blocks[-1]; dy=bbox(ln)[1]-last['y_bottom']; h=last['y_bottom']-last['y_top'] or 1
-        if (abs(dy)<=tol or dy/h<=gap) and ln['alineacion']==last['alineacion']:
-            last['text']+=' '+ln['texto']; last['y_bottom']=bbox(ln)[3]; last['lines'].append(ln)
-            last['font_size']=(last['font_size']+font_size(ln))/2
+# ── agrupación ──────────────────────────────────────────────────────────────
+def agrupar(lines: List[Dict[str, Any]], tol, gap, indent, right_tol, debug):
+    lines.sort(key=lambda l: (l['pagina'], _y(l), _x(l)))
+    out, cur, pag, prev_bottom = [], [], None, None
+    for ln in lines:
+        if pag != ln['pagina']:
+            if cur: out.append(make_block(cur)); cur = []
+            pag = ln['pagina']
+            page_lines = [l for l in lines if l['pagina']==pag]
+            min_x1 = min(_x(l) for l in page_lines)
+            max_x2 = max(bbox(l)[2] for l in page_lines)
+        ln['align'] = detect_align(ln, min_x1, max_x2, indent, right_tol)
+        if debug:
+            print(f"[dbg] pág {pag} y={_y(ln):>4} align={ln['align']:<10} {ln['texto'][:60]}")
+        if not cur:
+            cur.append(ln); prev_bottom=bbox(ln)[3]; continue
+        same_align = ln['align']==cur[0]['align'] and ln['align'] not in {'centrado','indice'}
+        dy = _y(ln) - prev_bottom
+        if same_align and (abs(dy)<=tol or dy/font_size(ln)<=gap):
+            cur.append(ln); prev_bottom=bbox(ln)[3]
         else:
-            blocks.append(nuevo_bloque(ln))
-    return blocks
+            out.append(make_block(cur)); cur=[ln]; prev_bottom=bbox(ln)[3]
+    if cur: out.append(make_block(cur))
+    return out
 
-def procesar_paginas(lines, *, tol, gap, indent, right_tol, debug):
-    by_page: Dict[int,List[Dict[str,Any]]] = {}
-    for ln in lines: by_page.setdefault(ln['pagina'],[]).append(ln)
-    res=[]
-    for pg in sorted(by_page):
-        lp=by_page[pg]; minx=min(bbox(l)[0] for l in lp); maxx=max(bbox(l)[2] for l in lp)
-        for ln in lp:
-            ln['alineacion']=detect_alineacion(ln,minx,maxx,indent,right_tol)
-            if debug:
-                li=bbox(ln)[0]-minx; ri=maxx-bbox(ln)[2]
-                print(f"[dbg] pág {pg:>2} y={bbox(ln)[1]:>4} LI={li:<3} RI={ri:<3} → {ln['alineacion']:<10} {ln['texto'][:60]}")
-        lp.sort(key=lambda l:bbox(l)[1])
-        res.extend(agrupar_lineas(lp,tol,gap))
-    return res
+# ── carga JSON OCR ──────────────────────────────────────────────────────────
+def load_lines(path: Path):
+    data = json.loads(path.read_text(encoding='utf-8'))
+    for l in data:
+        l['bbox'] = l.get('bbox') or [l['x'], l['y'], l['x']+l['w'], l['y']+l['h']]
+        l['align'] = l.pop('alineacion', l.get('align','izquierda'))
+    return data
 
-def cli():
-    ap=argparse.ArgumentParser(description='Agrupa líneas OCR en bloques.')
-    ap.add_argument('json_ocr',type=Path)
-    ap.add_argument('--output','-o',type=Path)
-    ap.add_argument('--pages',nargs='*',type=int)
-    ap.add_argument('--tol',type=int,default=4)
-    ap.add_argument('--gap',type=float,default=1.3)
-    ap.add_argument('--indent',type=int,default=25)
-    ap.add_argument('--right-tol',type=int,default=50)
-    ap.add_argument('--debug',action='store_true')
-    return ap.parse_args()
-
+# ── CLI ─────────────────────────────────────────────────────────────────────
 def main():
-    args=cli(); lines=cargar_lineas(args.json_ocr)
-    if args.pages: lines=[l for l in lines if l['pagina'] in args.pages]
-    bloques=procesar_paginas(lines,tol=args.tol,gap=args.gap,indent=args.indent,
-                             right_tol=args.right_tol,debug=args.debug)
-    guardar(bloques,args.output,args.json_ocr)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('json_ocr', type=Path)
+    ap.add_argument('--output','-o', type=Path)
+    ap.add_argument('--pages', nargs='*', type=int)
+    ap.add_argument('--tol-px', type=int, default=4)
+    ap.add_argument('--max-gap', type=float, default=1.3)
+    ap.add_argument('--indent', type=int, default=25)
+    ap.add_argument('--right-tol', type=int, default=50)
+    ap.add_argument('--debug', action='store_true')
+    args = ap.parse_args()
 
-if __name__=='__main__': main()
+    lines = load_lines(args.json_ocr)
+    if args.pages: lines = [l for l in lines if l['pagina'] in args.pages]
+
+    bloques = agrupar(lines, args.tol_px, args.max_gap, args.indent, args.right_tol, args.debug)
+
+    salida = json.dumps(bloques, ensure_ascii=False, indent=2)
+    if args.output:
+        args.output.write_text(salida, encoding='utf-8')
+    else:
+        # crea archivo _bloques.json y también imprime en pantalla
+        auto = args.json_ocr.with_name(args.json_ocr.stem + '_bloques.json')
+        auto.write_text(salida, encoding='utf-8')
+        # print(salida)
+
+if __name__ == '__main__':
+    main()
