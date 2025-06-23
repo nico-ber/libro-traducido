@@ -30,11 +30,18 @@ Genera un archivo `ocr_lineas.json` con el texto línea por línea.
 
 ```powershell
 python scripts/extraer_ocr.py datos/original.pdf `
+  --o datos/ocr_lineas.json `
+  --lang deu-frak+deu `
+  --debug
+
+  python scripts/extraer_ocr.py datos/original.pdf `
   --out datos/ocr_lineas.json `
   --dpi 350 `
   --lang deu-frak+deu `
   --psm 4 `
+  --pages 9 10 11 12 `
   --debug
+
 
 
 
@@ -42,13 +49,8 @@ python scripts/extraer_ocr.py datos/original.pdf `
 
 Genera salida.json con la información estructurada de los bloques detectados (párrafos, notas, imágenes, etc.).
 
-python scripts/extraer_bloques.py `
-      datos/ocr_lineas.json `
-      -o datos/bloques.json `
-      --max-gap 1.3 `
-      --indent-threshold 25 `
-      --justify-threshold 0.18 `
-      --merge-cross-page
+python scripts/extraer_bloques.py datos/ocr_lineas.json `
+    --debug
 
 
 ### Para extraer ciertas páginas de un PDF
