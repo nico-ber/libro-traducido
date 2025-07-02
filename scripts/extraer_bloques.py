@@ -7,10 +7,17 @@ extraer_bloques.py — Agrupa líneas OCR en bloques visuales.
 • Bloques unilínea: se marcan con "unilinea": true y omiten "lines".
 • Conserva pagina, bbox, font_size para trazabilidad.
 • Detección básica de referencias a notas al pie (refs_pie).
-• Si no usas -o, crea <nombre>_bloques.json automáticamente.
+• Si no usas -o, crea datos/bloques.json automáticamente.
+• Detecta alineación: justificado, izquierda, derecha, centrado, índice.
+• Considera tolerancia horizontal para márgenes al clasificar alineación.
+• Permite unir líneas con alineaciones compatibles (ej: justificado + izquierda).
+• Aplica heurísticas para unir primeras líneas con sangría y finales más cortas.
+• No agrupa líneas centradas: siempre se extraen como bloques unilínea.
+• Opcionalmente muestra información de depuración con --debug.
 
 Uso:
-  python extraer_bloques.py datos/ocr_lineas.json --pages 9 10 11 12 --debug
+  python extraer_bloques.py --pages 9 10 11 12 --debug
+  python extraer_bloques.py --json_ocr datos/ocr_lineas.json
 """
 
 import argparse
@@ -20,51 +27,68 @@ from pathlib import Path
 from collections import OrderedDict
 from typing import List, Dict, Any
 
-# ── patrones ────────────────────────────────────────────────────────────────
-DOT_RE = re.compile(r'[.·]{3,}')
+
+DISTANCIA_VERTICAL_MAX = 150  # Máxima separación vertical en px para unir líneas
+# ── patrones ────────────────────────────────────────────────────
+DOT_RE = re.compile(r'[.\u00b7]{3,}')
 END_NUM_RE = re.compile(r'\d{1,3}\s*$')
 FOOTNOTE_RE = re.compile(r'(?:\[(\d{1,3})\]|(\d{1,3})\)|([⁰¹²³⁴⁵⁶⁷⁸⁹]+))')
 
-# ── util geométrico ─────────────────────────────────────────────────────────
+# ── util geométrico ───────────────────────────────────────────
+
 def bbox(line: Dict[str, Any]) -> List[int]:
-    """Devuelve [x1,y1,x2,y2] aunque falten claves."""
     if 'bbox' in line and isinstance(line['bbox'], (list, tuple)) and len(line['bbox']) == 4:
         return line['bbox']
-
-    # Claves sueltas
     if {'x', 'y', 'w', 'h'} <= line.keys():
         return [line['x'], line['y'], line['x'] + line['w'], line['y'] + line['h']]
-
-    # Si sólo vienen x1,y1,x2,y2…
     if {'x1', 'y1', 'x2', 'y2'} <= line.keys():
         return [line['x1'], line['y1'], line['x2'], line['y2']]
-
-    # Fallback: todo a 0 para no romper el flujo
     return [0, 0, 0, 0]
 
 def _x(line): return line.get('x', line['bbox'][0])
 def _y(line): return line.get('y', line['bbox'][1])
-def font_size(line): return bbox(line)[3] - bbox(line)[1]
+def font_size(line):
+    if "font_size_pt_norm" in line:
+        return line["font_size_pt_norm"]
+    return bbox(line)[3] - bbox(line)[1]
 
-# ── notas al pie ────────────────────────────────────────────────────────────
+# ── notas al pie ────────────────────────────────────────────
+
 def refs_pie(text: str) -> List[str]:
     return [g for m in FOOTNOTE_RE.finditer(text) for g in m.groups() if g]
 
-# ── alineación ──────────────────────────────────────────────────────────────
+# ── alineación ──────────────────────────────────────────
+
 def detect_align(line, min_x1, max_x2, indent, right_tol):
     if 'texto' not in line:
         return None
-    ri = max_x2 - bbox(line)[2]
+
+    x1, y1, x2, y2 = bbox(line)
+    li = x1 - min_x1           # sangría izquierda
+    ri = max_x2 - x2           # margen derecho “flotante”
+    ancho = x2 - x1
+
     txt = line['texto']
+
+    # Justificado: si el texto va de margen a margen (ambos extremos cerca de los márgenes de la página)
+    if ancho > 0 and li / ancho < 0.15 and ri / ancho < 0.15:
+        return 'justificado'
+
+    # Casos especiales: índices o encabezados con puntos o números al final
     if ri <= right_tol and (DOT_RE.search(txt) or END_NUM_RE.search(txt)):
         return 'indice'
-    li = _x(line) - min_x1
-    if ri <= right_tol and li > indent: return 'derecha'
-    if li <= indent and ri <= right_tol: return 'justificado'
-    if li <= indent: return 'izquierda'
+
+    if li <= indent and ri <= right_tol:
+        return 'justificado'
+    if li <= indent:
+        return 'izquierda'
+    if ri <= right_tol and li > indent * 2:
+        return 'derecha'
+
     return 'centrado'
 
-# ── bloque helper ───────────────────────────────────────────────────────────
+# ── bloque helper ────────────────────────────────────────────
+
 def make_block(ls: List[Dict[str, Any]]) -> Dict[str, Any]:
     first = ls[0]
     b = OrderedDict()
@@ -79,46 +103,74 @@ def make_block(ls: List[Dict[str, Any]]) -> Dict[str, Any]:
     b['font_size'] = sum(fs)/len(fs) if fs else 0
     b['x_left'] = min(_x(l) for l in ls)
     b['x_right'] = max(bbox(l)[2] for l in ls)
-    # --- Agregar tipo SIEMPRE ---
     b['tipo'] = first.get('tipo', 'linea')
     if len(ls) == 1:
         b['unilinea'] = True
+        if b['alineacion'] == 'justificado' and b['text'].strip().isupper():
+            b['estirar_por_letras'] = True
     else:
         b['lines'] = ls
         for l in ls:
             l['tipo'] = b['tipo']
     return b
 
-# ── agrupación ──────────────────────────────────────────────────────────────
+# ── agrupación ──────────────────────────────────────────
+
 def agrupar(lines: List[Dict[str, Any]], tol, gap, indent, right_tol, debug):
-    lines.sort(key=lambda l: (l['pagina'], _y(l), _x(l)))
     out, cur, pag, prev_bottom = [], [], None, None
-    for ln in lines:
+    lines.sort(key=lambda l: (l['pagina'], _y(l), _x(l)))
+    for i, ln in enumerate(lines):
         if pag != ln['pagina']:
-            if cur: out.append(make_block(cur)); cur = []
+            if cur:
+                out.append(make_block(cur))
+                cur = []
             pag = ln['pagina']
-            page_lines = [l for l in lines if l['pagina']==pag]
+            page_lines = [l for l in lines if l['pagina'] == pag]
             min_x1 = min(_x(l) for l in page_lines)
             max_x2 = max(bbox(l)[2] for l in page_lines)
-        if 'texto' in ln:
-            ln['align'] = detect_align(ln, min_x1, max_x2, indent, right_tol)
-        else:
-            ln['align'] = None
+
+        ln['align'] = detect_align(ln, min_x1, max_x2, indent, right_tol) if 'texto' in ln else None
+
         if debug:
-            txt = ln['texto'] if 'texto' in ln else ''
+            txt = ln.get('texto', '')
             print(f"[dbg] pág {pag} y={_y(ln):>4} align={str(ln['align']):<10} {txt[:60]}")
+
+        # No agrupar líneas centradas
+        if ln['align'] == 'centrado':
+            if cur:
+                out.append(make_block(cur))
+                cur = []
+            out.append(make_block([ln]))
+            continue
+
         if not cur:
-            cur.append(ln); prev_bottom=bbox(ln)[3]; continue
-        same_align = ln['align']==cur[0]['align'] and ln['align'] not in {'centrado','indice'}
+            cur.append(ln)
+            prev_bottom = bbox(ln)[3]
+            continue
+
+        prev_ln = cur[-1]
         dy = _y(ln) - prev_bottom
-        if same_align and (abs(dy)<=tol or dy/font_size(ln)<=gap):
-            cur.append(ln); prev_bottom=bbox(ln)[3]
+
+        same_align = (
+            ln['align'] == prev_ln['align'] or
+            (prev_ln['align'] == 'justificado' and ln['align'] == 'izquierda') or
+            (prev_ln['align'] == 'derecha' and ln['align'] in {'justificado', 'izquierda'} and abs(prev_ln['bbox'][2] - ln['bbox'][2]) <= right_tol)
+        )
+
+        if same_align and dy <= DISTANCIA_VERTICAL_MAX:
+            cur.append(ln)
+            prev_bottom = bbox(ln)[3]
         else:
-            out.append(make_block(cur)); cur=[ln]; prev_bottom=bbox(ln)[3]
-    if cur: out.append(make_block(cur))
+            out.append(make_block(cur))
+            cur = [ln]
+            prev_bottom = bbox(ln)[3]
+
+    if cur:
+        out.append(make_block(cur))
     return out
 
-# ── carga JSON OCR ──────────────────────────────────────────────────────────
+# ── carga OCR ─────────────────────────────────────────
+
 def load_lines(path: Path):
     data = json.loads(path.read_text(encoding='utf-8'))
     for l in data:
@@ -126,10 +178,11 @@ def load_lines(path: Path):
         l['align'] = l.pop('alineacion', l.get('align','izquierda'))
     return data
 
-# ── CLI ─────────────────────────────────────────────────────────────────────
+# ── CLI ─────────────────────────────────────────
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('json_ocr', type=Path)
+    ap.add_argument('--json_ocr', type=Path, default='datos/ocr_lineas.json')
     ap.add_argument('--output','-o', type=Path)
     ap.add_argument('--pages', nargs='*', type=int)
     ap.add_argument('--tol-px', type=int, default=4)
@@ -140,7 +193,8 @@ def main():
     args = ap.parse_args()
 
     lines = load_lines(args.json_ocr)
-    if args.pages: lines = [l for l in lines if l['pagina'] in args.pages]
+    if args.pages:
+        lines = [l for l in lines if l['pagina'] in args.pages]
 
     bloques = agrupar(lines, args.tol_px, args.max_gap, args.indent, args.right_tol, args.debug)
 
@@ -148,7 +202,6 @@ def main():
     if args.output:
         args.output.write_text(salida, encoding='utf-8')
     else:
-        # SIEMPRE guardar como datos/bloques.json
         Path('datos/bloques.json').write_text(salida, encoding='utf-8')
 
 if __name__ == '__main__':

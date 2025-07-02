@@ -87,7 +87,7 @@ def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der)
     texto = bloque.get('text') or bloque.get('texto', '')
     if not texto.strip():
         return 0
-    font_size = bloque.get('font_size', 12) * rel_font
+    font_size = bloque.get('font_size', 12)
     alineacion = (bloque.get('alineacion', 'izquierda') or '').lower()
     c.setFont(CUSTOM_FONT_NAME, font_size)
 
@@ -96,12 +96,15 @@ def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der)
     altura_total = len(lineas) * font_size * 1.15
     y = y_actual - font_size
 
-    for linea in lineas:
+    for i, linea in enumerate(lineas):
+        es_ultima = (i == len(lineas) - 1)
         if alineacion in ['centrado', 'centro', 'center']:
             c.drawCentredString(page_width / 2, y, linea)
         elif alineacion in ['derecha', 'right']:
             c.drawRightString(page_width - margen_der, y, linea)
-        elif alineacion == 'justificado' and len(linea.strip().split()) > 1:
+        elif alineacion == 'justificado' and bloque.get('unilinea') and texto.isupper():
+            draw_justified_letters(c, texto, margen_izq, y, max_width, font_size)
+        elif alineacion == 'justificado' and len(linea.strip().split()) > 1 and not es_ultima:
             draw_justified(c, linea, margen_izq, y, max_width, font_size)
         else:
             c.drawString(margen_izq, y, linea)
@@ -121,12 +124,24 @@ def draw_justified(c, text, x, y, width, font_size):
         c.drawString(x_pos, y, word)
         x_pos += pdfmetrics.stringWidth(word, CUSTOM_FONT_NAME, font_size) + space_width
 
+def draw_justified_letters(c, text, x, y, width, font_size):
+    chars = list(text.strip())
+    if len(chars) <= 1:
+        c.drawString(x, y, text)
+        return
+    total_width = sum(pdfmetrics.stringWidth(ch, CUSTOM_FONT_NAME, font_size) for ch in chars)
+    spacing = (width - total_width) / (len(chars) - 1)
+    x_pos = x
+    for ch in chars:
+        c.drawString(x_pos, y, ch)
+        x_pos += pdfmetrics.stringWidth(ch, CUSTOM_FONT_NAME, font_size) + spacing
+
 # --- MAIN ---
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--bloques', required=True)
-    parser.add_argument('--pdf_original', required=True)
+    parser.add_argument('--bloques', default='datos/bloques.json')
+    parser.add_argument('--pdf_original', default='datos/original.pdf')
     parser.add_argument('--salida', default='maquetado.pdf')
     parser.add_argument('--pages', nargs='+', type=int)
     args = parser.parse_args()
