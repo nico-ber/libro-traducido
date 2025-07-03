@@ -4,26 +4,23 @@
 extraer_ocr.py — Extrae líneas OCR de un PDF, añade tamaños de fuente y normaliza globalmente.
 
 ▸ Cada línea incluye:
-    - font_size (px)
-    - font_size_pt: tamaño estimado en puntos (corrige si es mayúsculas)
+    - altura_px: altura base en píxeles
+    - grupo_fuente: tipo de caracter usado como referencia (core, mayuscula, etc.)
+    - font_size_pt: tamaño estimado en puntos
     - font_size_pt_norm: agrupado globalmente
-    - font_size_pt_orig: solo si se aplicó corrección (texto todo en mayúsculas)
 """
 
 from pathlib import Path
-import argparse, json, logging, re, time, unicodedata
+import argparse, json, logging, re, time
 
 import pdfplumber
 from pdf2image import convert_from_path, pdfinfo_from_path
-from pytesseract import image_to_data, Output
+from pytesseract import image_to_data, Output, image_to_boxes
+import random
 from PIL import Image
+from statistics import mean
 
-from collections import Counter
-from statistics import mean, median
-
-# Nueva función para estimar la altura de la fuente tomando las primeras palabras
-def estimar_altura_letras(image: Image.Image, bbox: list, lang: str, dpi: int = 400, debug=False) -> float:
-    from pytesseract import image_to_boxes
+def estimar_altura_letras(image: Image.Image, bbox: list, lang: str, texto: str, dpi: int = 400, debug=False):
     import numpy as np
 
     grupos = {
@@ -34,28 +31,31 @@ def estimar_altura_letras(image: Image.Image, bbox: list, lang: str, dpi: int = 
         "mayuscula": set("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
     }
 
-    FACTOR_POR_TIPO = {
-        "core": 1.35,
-        "ascendente": 1.1,
-        "mayuscula": 1.0,
-        "digito": 1.15,
-        "max": 1.2,
-    }
-
     recorte = image.crop((bbox[0], bbox[1], bbox[2], bbox[3]))
     h = recorte.size[1]
     boxes = image_to_boxes(recorte, lang=lang)
 
-    alturas = {
-        "core": [],
-        "ascendente": [],
-        "descendente": [],
-        "digito": [],
-        "mayuscula": [],
-        "otro": [],
-    }
+    # Limitar la cantidad de caracteres analizados
+    MAX_CARACTERES_ANALIZADOS = 10
+    box_lines = boxes.strip().splitlines()
+    if len(box_lines) > MAX_CARACTERES_ANALIZADOS:
+        box_lines = random.sample(box_lines, MAX_CARACTERES_ANALIZADOS)
 
-    for b in boxes.strip().splitlines():
+    if not boxes.strip():
+        logging.warning(f"[warn] sin boxes OCR en '{texto}'")
+        # fallback: usar altura del bbox directamente
+        altura_fallback = bbox[3] - bbox[1]
+        if altura_fallback > 0:
+            logging.debug(f"[debug] fallback activo: altura = {altura_fallback} px (desde bbox)")
+            grupo_fallback = "digito" if texto.isdigit() else "fallback"
+            return altura_fallback, grupo_fallback
+        else:
+            logging.debug(f"[debug] fallback fallido: sin altura detectable")
+            return 0, "max"
+
+    alturas = {k: [] for k in list(grupos.keys()) + ["otro"]}
+
+    for b in box_lines:
         parts = b.split()
         if len(parts) != 6:
             continue
@@ -65,23 +65,17 @@ def estimar_altura_letras(image: Image.Image, bbox: list, lang: str, dpi: int = 
             y2 = int(y2)
             altura = abs(y2 - y1)
             c = char.strip()
-            grupo = None
-            for g, letras in grupos.items():
-                if c in letras:
-                    grupo = g
-                    break
-            if not grupo:
-                grupo = "otro"
+            grupo = next((g for g, letras in grupos.items() if c in letras), "otro")
             alturas[grupo].append(altura)
         except:
             continue
 
-    resumen = {k: len(v) for k, v in alturas.items()}
-
     if debug:
-        print(f"[debug] caracteres detectados: {resumen}")
+        logging.debug(f"[debug] texto analizado: '{texto}' ({recorte.size[0]}x{recorte.size[1]} px)")
+        logging.debug(f"[debug] caracteres detectados por grupo:")
+        for g in ["core", "ascendente", "mayuscula", "digito", "descendente", "otro"]:
+            logging.debug(f"  - {g}: {len(alturas[g])}")
 
-    # Selección del grupo más representativo
     if len(alturas["core"]) >= 3:
         base = np.median(alturas["core"])
         fuente = "core"
@@ -99,13 +93,25 @@ def estimar_altura_letras(image: Image.Image, bbox: list, lang: str, dpi: int = 
         base = max(todas) if todas else 0
         fuente = "max"
 
-    factor = FACTOR_POR_TIPO.get(fuente, 1.2)
+    FACTOR_POR_TIPO = {
+        "core": 1.7,
+        "ascendente": 1.3,
+        "mayuscula": 1.0,
+        "digito": 1.2,
+        "max": 0.95,
+        "fallback": 1.0,
+        "fallback_digito": 1.2,
+    }
+    factor = FACTOR_POR_TIPO.get("fallback_digito" if fuente == "digito" and texto.isdigit() else fuente, 1.0)
     font_size_pt = base * 72 / dpi * factor
 
     if debug:
-        print(f"[debug] altura base seleccionada ({fuente}): {round(base, 1)} px × factor {factor} → {round(font_size_pt, 2)} pt")
+        logging.debug(f"[debug] grupo seleccionado como base: {fuente}")
+        logging.debug(f"[debug] altura base utilizada: {round(base, 1)} px")
+        logging.debug(f"[debug] factor aplicado: {factor}")
+        logging.debug(f"[debug] tamaño estimado: {round(font_size_pt, 2)} pt")
 
-    return font_size_pt
+    return base, fuente
 
 def agrupar_por_tolerancia(valores, tolerancia=0.6):
     valores_ordenados = sorted(valores)
@@ -150,9 +156,6 @@ def process_normal(pil: Image.Image, lang: str, psm: int, page_no: int, dpi: int
             k = (d["block_num"][i], d["par_num"][i], d["line_num"][i])
             groups.setdefault(k, []).append(i)
 
-    heights_px = [d["height"][i] for i, txt in enumerate(d["text"]) if txt.strip()]
-    heights = [h * 72 / dpi for h in heights_px]
-
     out = []
     for idxs in groups.values():
         xs = [d["left"][i] for i in idxs]
@@ -160,20 +163,13 @@ def process_normal(pil: Image.Image, lang: str, psm: int, page_no: int, dpi: int
         ws = [d["width"][i] for i in idxs]
         hs = [d["height"][i] for i in idxs]
 
-        # Usamos la función estimar_altura_letras para calcular el font_size_px
-        font_size_px = estimar_altura_letras(pil, [
-            min(xs), min(ys),
-            max(x + w for x, w in zip(xs, ws)),
-            max(y + h for y, h in zip(ys, hs))
-        ], lang)
-
-        font_size_pt_orig = font_size_px * 72 / dpi * 1.3  # factor de corrección por x-height
-
         linea_texto = " ".join(d["text"][i].strip() for i in idxs)
-        if linea_texto.isupper():
-            font_size_pt = font_size_pt_orig / 0.75
-        else:
-            font_size_pt = font_size_pt_orig
+
+        altura_px, grupo_fuente = estimar_altura_letras(pil, [min(xs), min(ys), max(x + w for x, w in zip(xs, ws)), max(y + h for y, h in zip(ys, hs))], lang, texto=linea_texto, dpi=dpi, debug=debug)
+        FACTOR_POR_TIPO = {"core": 1.7, "ascendente": 1.3, "mayuscula": 1.0, "digito": 1.2, "max": 0.95}
+        factor = FACTOR_POR_TIPO.get(grupo_fuente, 1.0)
+        font_size_pt = altura_px * 72 / dpi * factor
+
         font_size_pt_norm = asignar_cluster(font_size_pt, clusters)
 
         linea = {
@@ -183,12 +179,11 @@ def process_normal(pil: Image.Image, lang: str, psm: int, page_no: int, dpi: int
             "texto": linea_texto,
             "tipo": "linea",
             "pagina": page_no,
-            "font_size": font_size_px,
-            "font_size_pt": font_size_pt,
+            "altura_px": altura_px,
+            "grupo_fuente": grupo_fuente,
+            "font_size_pt": round(font_size_pt, 2),
             "font_size_pt_norm": round(font_size_pt_norm)
         }
-        if linea_texto.isupper():
-            linea["font_size_pt_orig"] = font_size_pt_orig
         out.append(linea)
     return out
 
@@ -204,14 +199,27 @@ def image_blocks(pdf: Path, page: int):
     return out
 
 def main():
+    t0_total = time.time()
+    import logging
+    logging.getLogger("pdfminer").setLevel(logging.WARNING)
+    logging.getLogger("pdfplumber").setLevel(logging.WARNING)
+    logging.getLogger("pdf2image").setLevel(logging.WARNING)
+
     args = cli()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(levelname)s: %(message)s",
+        handlers=[
+            logging.FileHandler("ocr_debug.log", mode="w", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+
     total = pdfinfo_from_path(args.pdf)["Pages"]
     pages = args.pages or range(1, total + 1)
 
     salida, t0 = [], time.time()
 
-    # 🔁 Recolectar alturas de todo el documento
     all_heights_pt = []
     for p in pages:
         pil = convert_from_path(args.pdf, dpi=args.dpi, first_page=p, last_page=p)[0]
@@ -228,7 +236,6 @@ def main():
             print(f"  - {c} pt")
         print("")
 
-    # 🔁 OCR por página
     for p in pages:
         logging.info("Procesando página %s (normal)", p)
         pil = convert_from_path(args.pdf, dpi=args.dpi, first_page=p, last_page=p)[0]
@@ -237,6 +244,7 @@ def main():
 
     args.out.write_text(json.dumps(salida, ensure_ascii=False, indent=2), "utf-8")
     logging.info("✅ %s items → %s (%.1f s)", len(salida), args.out, time.time() - t0)
+    logging.info("⏱️ Tiempo total de ejecución: %.2f s", time.time() - t0_total)
 
 if __name__ == "__main__":
     main()

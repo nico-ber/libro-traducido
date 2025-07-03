@@ -18,10 +18,10 @@ import numpy as np
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pdf", type=Path, required=True)
-    parser.add_argument("--ocr", type=Path, required=True)
-    parser.add_argument("--pagina", type=int, required=True)
-    parser.add_argument("--texto", type=str, required=True)
+    parser.add_argument("--pdf", type=Path, default='datos/original.pdf')
+    parser.add_argument("--ocr", type=Path, default='datos/ocr_lineas.json')
+    parser.add_argument("--pagina", type=int, default=4)
+    parser.add_argument("--texto", type=str, default="Zweite bedeutend vermehrte und verbesserte Auflage")
     parser.add_argument("--dpi", type=int, default=400)
     parser.add_argument("--lang", type=str, default="deu-frak+deu")
     parser.add_argument("--out", type=Path, default=Path("debug_bbox.png"))
@@ -31,7 +31,18 @@ def main():
     with open(args.ocr, encoding="utf-8") as f:
         ocr_data = json.load(f)
 
-    linea = next(b for b in ocr_data if b["pagina"] == args.pagina and b["texto"].strip() == args.texto.strip())
+    try:
+        linea = next(
+            b for b in ocr_data
+            if isinstance(b, dict)
+            and "pagina" in b and "texto" in b
+            and b["pagina"] == args.pagina
+            and b["texto"].strip() == args.texto.strip()
+        )
+    except StopIteration:
+        print(f"❌ No se encontró la línea con texto '{args.texto}' en la página {args.pagina}")
+        return
+
     bbox = linea["bbox"]
 
     imagen = convert_from_path(args.pdf, dpi=args.dpi, first_page=args.pagina, last_page=args.pagina)[0]
@@ -65,7 +76,7 @@ def main():
         font_size_pt = mediana_px * 72 / args.dpi * args.factor
         draw.text((5, 5), f"Altura mediana: {mediana_px:.1f}px", fill="black")
         draw.text((5, 20), f"Tamaño estimado: {font_size_pt:.2f} pt", fill="black")
-        print( f"Altura mediana: {mediana_px:.1f}px")
+        print(f"Altura mediana: {mediana_px:.1f}px")
         print(f"Tamaño estimado: {font_size_pt:.2f} pt")
 
     recorte.save(args.out)

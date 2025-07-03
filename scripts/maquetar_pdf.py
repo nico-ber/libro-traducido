@@ -21,6 +21,7 @@ Uso:
 import json
 import fitz  # PyMuPDF
 from reportlab.pdfgen import canvas
+
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import simpleSplit
@@ -31,6 +32,7 @@ CUSTOM_FONT_PATH = "datos/CA Moskow has a plan W00 Reg.ttf"
 CUSTOM_FONT_NAME = "CA_Moskow"
 NUM_PAGINAS_MUESTRA = 20
 ESPACIO_ENTRE_BLOQUES = 8
+TIPOGRAFIA_ESCALA_VISUAL = 1.5  # Ajuste por diferencia con altura visual original
 
 # --- FUNCIONES ---
 def detectar_margenes(pdf_path, num_paginas=10):
@@ -87,7 +89,7 @@ def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der)
     texto = bloque.get('text') or bloque.get('texto', '')
     if not texto.strip():
         return 0
-    font_size = bloque.get('font_size', 12)
+    font_size = bloque.get('font_size', 12) * TIPOGRAFIA_ESCALA_VISUAL
     alineacion = (bloque.get('alineacion', 'izquierda') or '').lower()
     c.setFont(CUSTOM_FONT_NAME, font_size)
 
@@ -142,7 +144,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bloques', default='datos/bloques.json')
     parser.add_argument('--pdf_original', default='datos/original.pdf')
-    parser.add_argument('--salida', default='maquetado.pdf')
+    parser.add_argument('--salida', default='datos/maquetado.pdf')
     parser.add_argument('--pages', nargs='+', type=int)
     args = parser.parse_args()
 
