@@ -33,6 +33,8 @@ CUSTOM_FONT_NAME = "CA_Moskow"
 NUM_PAGINAS_MUESTRA = 20
 ESPACIO_ENTRE_BLOQUES = 8
 TIPOGRAFIA_ESCALA_VISUAL = 1.5  # Ajuste por diferencia con altura visual original
+MARGEN_INTERNO_SUP = 0.18  # proporción del font_size
+INTERLINEADO = 1.15  # Multiplicador de font_size para espacio entre líneas
 
 # --- FUNCIONES ---
 def detectar_margenes(pdf_path, num_paginas=10):
@@ -85,20 +87,29 @@ def draw_image(c, pdf_path, bloque, page_height):
     except Exception as e:
         print(f"[ERROR] No se pudo insertar imagen {img_path}: {e}")
 
-def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der):
+def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der, page_height, margen_sup, margen_inf):
+    salto_pagina_ocurrio = False
     texto = bloque.get('text') or bloque.get('texto', '')
     if not texto.strip():
-        return 0
+        return y_actual  # se sale antes de usar font_size si no hay texto
     font_size = bloque.get('font_size', 12) * TIPOGRAFIA_ESCALA_VISUAL
-    alineacion = (bloque.get('alineacion', 'izquierda') or '').lower()
     c.setFont(CUSTOM_FONT_NAME, font_size)
-
+    pagina = bloque.get('pagina', '?')
     max_width = page_width - margen_izq - margen_der
     lineas = simpleSplit(texto, CUSTOM_FONT_NAME, font_size, max_width)
-    altura_total = len(lineas) * font_size * 1.15
-    y = y_actual - font_size
+    alineacion = (bloque.get('alineacion', 'izquierda') or '').lower()
+    print(f"[BLOQUE] pág={pagina}, font={font_size:.1f}, líneas estimadas={len(lineas)}")
+    line_height = font_size * INTERLINEADO
+    altura_total = len(lineas) * line_height
 
+    y = y_actual - font_size
     for i, linea in enumerate(lineas):
+        if y - line_height < margen_inf:
+            print(f"[SALTO AUTOMÁTICO] Salto de página en medio de bloque en página actual")
+            salto_pagina_ocurrio = True
+            c.showPage()
+            c.setFont(CUSTOM_FONT_NAME, font_size)
+            y = page_height - margen_sup - font_size
         es_ultima = (i == len(lineas) - 1)
         if alineacion in ['centrado', 'centro', 'center']:
             c.drawCentredString(page_width / 2, y, linea)
@@ -110,9 +121,9 @@ def draw_text(c, bloque, page_width, y_actual, rel_font, margen_izq, margen_der)
             draw_justified(c, linea, margen_izq, y, max_width, font_size)
         else:
             c.drawString(margen_izq, y, linea)
-        y -= font_size * 1.15
+        y -= line_height
 
-    return altura_total
+    return y, True, salto_pagina_ocurrio  # devuelve posición vertical final
 
 def draw_justified(c, text, x, y, width, font_size):
     words = text.strip().split()
@@ -164,6 +175,7 @@ def main():
 
     with open(args.bloques, 'r', encoding='utf-8') as f:
         bloques = json.load(f)
+    bloques = [b for b in bloques if b.get('tipo') != 'numero_pagina' and not b.get('omitido')]
 
     if args.pages:
         bloques = [b for b in bloques if b.get('pagina') in args.pages]
@@ -185,22 +197,31 @@ def main():
 
     pagina_actual = None
     y_cursor = page_height - MARGEN_SUPERIOR_PX
+    pagina_forzada = False
 
     for bloque in bloques:
         pagina = bloque.get('pagina', 1)
         tipo = (bloque.get('tipo', '') or '').lower()
 
         if pagina != pagina_actual:
-            if pagina_actual is not None:
+            if not pagina_forzada and pagina_actual is not None:
                 c.showPage()
             pagina_actual = pagina
-            y_cursor = page_height - MARGEN_SUPERIOR_PX
+            if not pagina_forzada:
+                y_cursor = page_height - MARGEN_SUPERIOR_PX
+            pagina_forzada = False  # se resetea siempre
 
         if tipo == 'imagen':
             draw_image(c, args.pdf_original, bloque, page_height)
         elif tipo in ['linea', 'encabezado', 'titulo', 'cita', 'indice', 'parrafo']:
-            alto = draw_text(c, bloque, page_width, y_cursor, rel_font, margen_izq, page_width - margen_der)
-            y_cursor -= alto + ESPACIO_ENTRE_BLOQUES
+            font_size = bloque.get('font_size', 12) * TIPOGRAFIA_ESCALA_VISUAL
+            y_cursor, dibujado, pagina_forzada = draw_text(c, bloque, page_width, y_cursor, rel_font, margen_izq, page_width - margen_der, page_height, MARGEN_SUPERIOR_PX, MARGEN_INFERIOR_PX)
+            espacio = bloque.get("espacio_despues", ESPACIO_ENTRE_BLOQUES)
+            
+        # Saltar página si el bloque requiere salto explícito
+        
+        print("bloque evaluado", bloque["pagina"])
+    y_cursor -= espacio * rel_font
 
     c.save()
     print(f"PDF maquetado generado: {args.salida}")
