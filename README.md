@@ -24,29 +24,35 @@ pip install -r requirements.txt
 
 ## 🧠 Uso
 
-### Rehacer OCR
+### Flujo de trabajo recomendado
 
-Genera un archivo `ocr_lineas.json` con el texto línea por línea.
+El proceso de OCR se ha dividido en dos pasos para mayor eficiencia:
+
+#### Opción 1: Proceso completo automatizado
+```powershell
+python scripts/ejecutar_ocr_completo.py
+```
+
+#### Opción 2: Proceso paso a paso
+
+**Paso 1: Normalizar tamaños de fuente**
+```powershell
+python scripts/normalizar_fuentes.py --pdf datos/extracto.pdf --debug
+```
+
+**Paso 2: Extraer OCR con normalización**
+```powershell
+python scripts/extraer_ocr.py --pdf datos/extracto.pdf --debug
+```
+
+### Uso directo (sin normalización)
+Si prefieres usar el script original sin normalización:
 
 ```powershell
-python scripts/extraer_ocr.py datos/original.pdf `
-  --o datos/ocr_lineas.json `
-  --lang deu-frak+deu `
-  --debug
-
-  python scripts/extraer_ocr.py datos/original.pdf `
-  --out datos/ocr_lineas.json `
-  --dpi 350 `
-  --lang deu-frak+deu `
-  --psm 4 `
-  --pages 9 10 11 12 `
-  --debug
-
-
+python scripts/extraer_ocr.py --no-images --pages 6-8 --visual-style --debug
 
 
 ### Extraer bloques visuales (texto, imágenes)
-
 Genera salida.json con la información estructurada de los bloques detectados (párrafos, notas, imágenes, etc.).
 
 python scripts/extraer_bloques.py datos/ocr_lineas.json `
@@ -54,5 +60,4 @@ python scripts/extraer_bloques.py datos/ocr_lineas.json `
 
 
 ### Para extraer ciertas páginas de un PDF
-
 python extract_pages.py original.pdf salida.pdf 4-11
